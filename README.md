@@ -1,80 +1,161 @@
 # DeployWanGP
 
-# Wan2GP Docker Deployment (Garuda Linux / RTX 4060 Ti)
+DeployWanGP provides a single Bash script for building and running
+[Wan2GP](https://github.com/deepbeepmeep/Wan2GP) in Docker. The defaults target
+Garuda/Arch Linux with an NVIDIA RTX 4060 Ti (CUDA compute capability 8.9), but
+the configuration variables at the top of `deploy.sh` can be adjusted for
+another host or GPU.
 
-A robust, automated deployment script for running **Wan2GP** locally using Docker. This environment is specifically optimized for NVIDIA RTX 4000 series GPUs (Ada Lovelace architecture) and engineered to be highly resilient over cellular/4G network connections.
+## What the script does
 
-## ✨ Key Features
+Each run of `deploy.sh`:
 
-* **Hardware Optimized:** Automatically patches compilation scripts to target CUDA compute capability `8.9` (RTX 4060 Ti), significantly reducing build times and improving VRAM efficiency.
-* **Cellular/4G Resilient:** Bypasses standard Ubuntu mirrors in favor of Azure mirrors, forces strict packet retries, and disables HTTP pipelining to prevent `400 Bad Request` drops over mobile hotspots.
-* **Root Privilege Bypass:** Ignores upstream restrictive entrypoint scripts to prevent `CUDA unknown error` crashes caused by locked `/dev/nvidia-caps` host files on Arch/Garuda Linux.
-* **Shared Memory (IPC):** Uses `--ipc=host` to prevent CUDA memory conflicts when running alongside other AI containers (like SDNext or Open-WebUI).
+1. Clones Wan2GP into `~/Wan2GP`, or resets the upstream build files and pulls
+   the latest upstream changes when that directory already exists.
+2. Creates persistent checkpoint, output, and LoRA directories under
+   `~/wan2gp-data`.
+3. Generates build-time patches that set the CUDA architecture explicitly and
+   configure Ubuntu's Azure package mirror with additional APT retry settings.
+4. Builds the local `wan2gp:latest` image.
+5. Replaces any existing `wan2gp-video` container and starts the new container.
 
----
+The application is published at <http://localhost:7862> by default.
 
-## 🚀 Getting Started
+> [!IMPORTANT]
+> An update discards local changes to `Dockerfile`, `setup.py`, and
+> `entrypoint.sh` inside `~/Wan2GP`. Commit or back up changes to those files
+> before running the script again.
 
-### 1. Prerequisites
-Ensure you have the following installed on your host system:
-* Docker Engine
-* NVIDIA Container Toolkit (`nvidia-docker2` / `nvidia-container-toolkit`)
-* Git
+## Prerequisites
 
-### 2. Deployment
-Make the script executable and run it. The script is idempotent—you can run it multiple times safely to update the repository or rebuild the container.
+- A Linux host with a supported NVIDIA GPU and a working NVIDIA driver
+- [Docker Engine](https://docs.docker.com/engine/install/)
+- [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+- Git and Python 3
+- Enough free disk space for the Docker image, model checkpoints, and outputs
+
+Confirm that Docker can access the GPU before deploying:
+
+```bash
+docker run --rm --gpus all ubuntu nvidia-smi
+```
+
+## Deploy
+
+Clone this repository, then run:
 
 ```bash
 chmod +x deploy.sh
 ./deploy.sh
-3. Accessing the UI
-Once the script completes and the container boots up, access the Gradio web interface at:
+```
 
-http://localhost:7862
+Follow the startup logs until the service is ready:
 
-📂 Directory Structure
-The deployment script automatically separates your application code from your heavy user data to keep upgrades seamless.
-
-Application Code: ~/Wan2GP (Live mounted into the container at /workspace)
-
-User Data: ~/wan2gp-data
-
-/ckpts - Downloaded video models and checkpoint weights.
-
-/loras - Custom LoRA files.
-
-/outputs - Generated MP4 videos and images.
-
-🛠️ Troubleshooting
-Issue: RuntimeError: CUDA unknown error
-Symptom: The container starts, but the logs (docker logs wan2gp-video) show that PyTorch cannot initialize CUDA, often reporting zero available devices despite nvidia-smi seeing the GPU.
-Cause: The host's NVIDIA Unified Memory kernel module (nvidia_uvm) is locked by a suspended container or a memory leak.
-Fix:
-
-Option A: Reboot your PC (fastest and cleanest).
-
-Option B: Reload the driver module manually:
-
-Bash
-# Stop all running GPU containers
-docker stop $(docker ps -q)
-# Reload the unified memory module
-sudo modprobe -r nvidia_uvm && sudo modprobe nvidia_uvm
-# Restart Docker
-sudo systemctl restart docker
-Issue: Cannot connect to localhost:7862
-Symptom: curl: (56) Recv failure: Connection reset by peer or the web page refuses to load.
-Fix: Check the live container logs to see if Python is still downloading prerequisite models or if it crashed during initialization:
-
-Bash
+```bash
 docker logs -f wan2gp-video
-Issue: Remote Access Blocked
-Symptom: You can access the UI on localhost, but not from another device on your network or via a reverse proxy domain.
-Fix: The application runs on port 7860 inside the container but is mapped to 7862 on the host. Ensure your host firewall (UFW/Firewalld) allows traffic on port 7862, or set up a Caddy reverse proxy pointing to localhost:7862.
+```
 
-🔄 Updating Wan2GP
-To pull the latest code from the upstream Wan2GP repository and rebuild the environment:
+Open <http://localhost:7862> in a browser. Startup can take longer on the first
+run while dependencies or models are downloaded.
 
-Run ./deploy.sh
+## Configuration
 
-The script will automatically reset local patches, git pull the latest main branch, re-apply the RTX/4G optimizations, and restart the container.
+The deployment settings are constants near the top of `deploy.sh`:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CONTAINER_NAME` | `wan2gp-video` | Name of the running Docker container |
+| `IMAGE_NAME` | `wan2gp:latest` | Locally built image name and tag |
+| `HOST_PORT` | `7862` | Host port mapped to container port 7860 |
+| `APP_DIR` | `~/Wan2GP` | Upstream source checkout |
+| `DATA_DIR` | `~/wan2gp-data` | Persistent application data |
+| `CUDA_ARCH` | `8.9` | CUDA compute capability used for the build |
+
+Edit these values before running the script when the defaults do not match the
+host. In particular, set `CUDA_ARCH` to the compute capability of the target
+GPU; the default is intended for an RTX 4060 Ti.
+
+## Persistent data
+
+The source checkout and user data are mounted into the container:
+
+```text
+~/Wan2GP/                 -> /workspace
+~/wan2gp-data/ckpts/      -> /workspace/ckpts
+~/wan2gp-data/loras/      -> /workspace/loras
+~/wan2gp-data/outputs/    -> /workspace/outputs
+```
+
+Removing or replacing the container does not delete the data in these host
+directories.
+
+## Security considerations
+
+The container deliberately runs as root with `--privileged`, `--gpus all`, and
+`--ipc=host`. The data directory is also made writable by every local user.
+These settings work around GPU device-access issues seen on the intended host,
+but substantially reduce container isolation. Review `deploy.sh` before use,
+and only run it on a trusted single-user machine unless those permissions have
+been tightened for your environment.
+
+The UI binds to all interfaces inside the container, and Docker publishes the
+host port. Do not expose port 7862 to an untrusted network without authentication
+and an appropriately configured firewall or reverse proxy.
+
+## Updating
+
+Run the deployment command again:
+
+```bash
+./deploy.sh
+```
+
+This updates the upstream checkout, rebuilds the image, and replaces the
+existing container. Checkpoints, LoRAs, and generated outputs remain in
+`~/wan2gp-data`.
+
+## Troubleshooting
+
+### CUDA is unavailable inside the container
+
+First verify GPU access independently of Wan2GP:
+
+```bash
+nvidia-smi
+docker run --rm --gpus all ubuntu nvidia-smi
+```
+
+If the host sees the GPU but Docker does not, check the NVIDIA Container Toolkit
+installation and Docker configuration. If logs report a CUDA initialization
+error associated with a stuck `nvidia_uvm` module, rebooting is the safest way
+to reset the driver. Advanced users can stop GPU workloads and reload the module:
+
+```bash
+docker ps -q | xargs -r docker stop
+sudo modprobe -r nvidia_uvm
+sudo modprobe nvidia_uvm
+sudo systemctl restart docker
+```
+
+Reloading the module interrupts every process using the GPU.
+
+### The UI does not respond on port 7862
+
+Check the container state and logs:
+
+```bash
+docker ps -a --filter name=wan2gp-video
+docker logs -f wan2gp-video
+```
+
+If the container is running, confirm the configured `HOST_PORT` and ensure the
+host firewall permits that port. For access from another device, use the host's
+LAN address rather than `localhost`.
+
+### A build fails after an upstream update
+
+The deployment patches depend on the layout of Wan2GP's upstream `Dockerfile`
+and `setup.py`. Inspect the build output and the generated files in `~/Wan2GP`
+if upstream changes make those patches incompatible. The build must complete
+successfully before the existing container is stopped, so a build failure leaves
+the previously deployed container in place.
